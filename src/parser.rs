@@ -525,23 +525,7 @@ impl<'a, R: BufRead> Parser<'a, R> {
 
     // Used for the axiom whitelist feature.
     fn name_to_string(&self, n: NamePtr<'a>) -> String {
-        match self.dag.names.get_index(n.idx()).copied().unwrap() {
-            Name::Anon => String::new(),
-            Name::Str(pfx, sfx, _) => {
-                let mut s = self.name_to_string(pfx);
-                if !s.is_empty() {
-                    s.push('.');
-                }
-                s + self.dag.strings.get_index(sfx.idx()).unwrap()
-            }
-            Name::Num(pfx, sfx, _) => {
-                let mut s = self.name_to_string(pfx);
-                if !s.is_empty() {
-                    s.push('.');
-                }
-                s + format!("{}", sfx).as_str()
-            }
-        }
+        self.dag.name_to_string(n)
     }
 
     fn go1(&mut self, line: &str) -> Result<(), Box<dyn Error>> {

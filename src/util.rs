@@ -202,7 +202,7 @@ impl<'t> ExprCache<'t> {
 
 pub struct ExportFile<'p> {
     /// The underlying storage for `Name`, `Level`, and `Expr` items (and Strings).
-    pub(crate) dag: LeanDag<'p>,
+    pub dag: LeanDag<'p>,
     /// Declarations from the export file
     pub declars: DeclarMap<'p>,
     /// Notations from the export file
@@ -309,11 +309,15 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
         f(&mut PrettyPrinter::new(self))
     }
 
-    pub fn read_name(&self, p: NamePtr<'t>) -> Name<'t> {
+    pub fn dag_of_ptr<A>(&self, p: Ptr<A>) -> &LeanDag<'t> {
         match p.dag_marker() {
-            DagMarker::ExportFile => self.export_file.dag.names.get_index(p.idx()).copied().unwrap(),
-            DagMarker::TcCtx => self.dag.names.get_index(p.idx()).copied().unwrap(),
+            DagMarker::ExportFile => &self.export_file.dag,
+            DagMarker::TcCtx => &*self.dag,
         }
+    }
+
+    pub fn read_name(&self, p: NamePtr<'t>) -> Name<'t> {
+        self.dag_of_ptr(p).read_name(p)
     }
 
     /// Convenience function for reading two items as a tuple.
@@ -322,10 +326,7 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     }
 
     pub fn read_level(&self, p: LevelPtr<'t>) -> Level<'t> {
-        match p.dag_marker() {
-            DagMarker::ExportFile => self.export_file.dag.levels.get_index(p.idx()).copied().unwrap(),
-            DagMarker::TcCtx => self.dag.levels.get_index(p.idx()).copied().unwrap(),
-        }
+        self.dag_of_ptr(p).read_level(p)
     }
 
     /// Convenience function for reading two items as a tuple.
@@ -334,10 +335,7 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     }
 
     pub fn read_expr(&self, p: ExprPtr<'t>) -> Expr<'t> {
-        match p.dag_marker() {
-            DagMarker::ExportFile => self.export_file.dag.exprs.get_index(p.idx()).copied().unwrap(),
-            DagMarker::TcCtx => self.dag.exprs.get_index(p.idx()).copied().unwrap(),
-        }
+        self.dag_of_ptr(p).read_expr(p)
     }
 
     /// Convenience function for reading two items as a tuple.
@@ -346,23 +344,36 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     }
 
     pub fn read_string(&self, p: StringPtr<'t>) -> &CowStr<'t> {
-        match p.dag_marker() {
-            DagMarker::ExportFile => self.export_file.dag.strings.get_index(p.idx()).unwrap(),
-            DagMarker::TcCtx => self.dag.strings.get_index(p.idx()).unwrap(),
-        }
+        self.dag_of_ptr(p).read_string(p)
     }
 
     pub fn read_bignum(&self, p: BigUintPtr<'t>) -> Option<&BigUint> {
-        match p.dag_marker() {
-            DagMarker::ExportFile => Some(self.export_file.dag.bignums.as_ref()?.get_index(p.idx()).unwrap()),
-            DagMarker::TcCtx => Some(self.dag.bignums.as_ref()?.get_index(p.idx()).unwrap()),
-        }
+        self.dag_of_ptr(p).read_bignum(p)
     }
 
     pub fn read_levels(&self, p: LevelsPtr<'t>) -> Arc<[LevelPtr<'t>]> {
-        match p.dag_marker() {
-            DagMarker::ExportFile => self.export_file.dag.uparams.get_index(p.idx()).cloned().unwrap(),
-            DagMarker::TcCtx => self.dag.uparams.get_index(p.idx()).cloned().unwrap(),
+        self.dag_of_ptr(p).read_levels(p)
+    }
+
+    pub fn name_to_string(&self, n: NamePtr<'t>) -> String {
+        match self.read_name(n) {
+            Name::Anon => String::new(),
+            Name::Str(pfx, sfx, _) => {
+                let mut out = self.name_to_string(pfx);
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(self.read_string(sfx).as_ref());
+                out
+            }
+            Name::Num(pfx, sfx, _) => {
+                let mut out = self.name_to_string(pfx);
+                if !out.is_empty() {
+                    out.push('.');
+                }
+                out.push_str(format!("{}", sfx).as_str());
+                out
+            }
         }
     }
 
@@ -667,6 +678,30 @@ impl<'t, 'p: 't> TcCtx<'t, 'p> {
     }
 }
 
+/// Splits a string to name components. For example, `foo.bla.«bo.o»` ↦ `["foo", "bla", "«bo.o»"]`.
+fn split_name_lit(mut s: &str) -> Option<Vec<&str>> {
+    let mut components = Vec::new();
+    while !s.is_empty() {
+        let end = if s.starts_with('«') {
+            s.find('»')? + '»'.len_utf8()
+        } else {
+            s.find('.').unwrap_or(s.len())
+        };
+        if end == 0 {
+            return None;
+        }
+        components.push(&s[..end]);
+        s = &s[end..];
+        if !s.is_empty() {
+            s = s.strip_prefix('.')?;
+            if s.is_empty() {
+                return None;
+            }
+        }
+    }
+    Some(components)
+}
+
 #[derive(Debug)]
 pub struct LeanDag<'a> {
     pub names: UniqueIndexSet<Name<'a>>,
@@ -717,20 +752,27 @@ impl<'a> LeanDag<'a> {
     }
 
     // Find e.g. `Quot.lift` from "Quot.lift"
-    fn find_name(&self, dot_separated_name: &str) -> Option<NamePtr<'a>> {
+    pub fn find_name(&self, dot_separated_name: &str) -> Option<NamePtr<'a>> {
         let mut pfx = self.anonymous();
-        for s in dot_separated_name.split('.') {
+        for s in split_name_lit(dot_separated_name)? {
             if let Ok(num) = s.parse::<u64>() {
                 let hash = hash64!(crate::name::NUM_HASH, pfx, num);
                 if let Some(idx) = self.names.get_index_of(&Name::Num(pfx, num, hash)) {
                     pfx = Ptr::from(DagMarker::ExportFile, idx);
                     continue
                 }
-            } else if let Some(sfx) = self.get_string_ptr(s) {
-                let hash = hash64!(crate::name::STR_HASH, pfx, sfx);
-                if let Some(idx) = self.names.get_index_of(&Name::Str(pfx, sfx, hash)) {
-                    pfx = Ptr::from(DagMarker::ExportFile, idx);
-                    continue
+            } else {
+                let s = if s.starts_with('«') {
+                    s.strip_prefix('«')?.strip_suffix('»')?
+                } else {
+                    s
+                };
+                if let Some(sfx) = self.get_string_ptr(s) {
+                    let hash = hash64!(crate::name::STR_HASH, pfx, sfx);
+                    if let Some(idx) = self.names.get_index_of(&Name::Str(pfx, sfx, hash)) {
+                        pfx = Ptr::from(DagMarker::ExportFile, idx);
+                        continue
+                    }
                 }
             }
             return None
@@ -773,6 +815,53 @@ impl<'a> LeanDag<'a> {
             list: self.find_name("List"),
             list_nil: self.find_name("List.nil"),
             list_cons: self.find_name("List.cons"),
+        }
+    }
+
+    pub fn read_name(&self, p: NamePtr<'a>) -> Name<'a> {
+        self.names.get_index(p.idx()).copied().unwrap()
+    }
+
+    pub fn read_level(&self, p: LevelPtr<'a>) -> Level<'a> {
+        self.levels.get_index(p.idx()).copied().unwrap()
+    }
+
+    pub fn read_expr(&self, p: ExprPtr<'a>) -> Expr<'a> {
+        self.exprs.get_index(p.idx()).copied().unwrap()
+    }
+
+    pub fn read_string(&self, p: StringPtr<'a>) -> &CowStr<'a> {
+        self.strings.get_index(p.idx()).unwrap()
+    }
+
+    pub fn read_bignum(&self, p: BigUintPtr<'a>) -> Option<&BigUint> {
+        Some(self.bignums.as_ref()?.get_index(p.idx()).unwrap())
+    }
+
+    pub fn read_levels(&self, p: LevelsPtr<'a>) -> Arc<[LevelPtr<'a>]> {
+        self.uparams.get_index(p.idx()).cloned().unwrap()
+    }
+
+    /// Renders name to dot-separated string without escaping.
+    pub fn name_to_string(&self, name: NamePtr<'a>) -> String {
+        match self.read_name(name) {
+            crate::name::Name::Anon => String::new(),
+            crate::name::Name::Str(pfx, sfx, _) => {
+                let mut s = self.name_to_string(pfx);
+                if !s.is_empty() {
+                    s.push('.');
+                }
+                s.push_str(self.read_string(sfx));
+                s
+            }
+            crate::name::Name::Num(pfx, sfx, _) => {
+                let mut s = self.name_to_string(pfx);
+                if !s.is_empty() {
+                    s.push('.');
+                }
+                s.push_str(&sfx.to_string());
+                s
+            }
         }
     }
 }
@@ -1015,3 +1104,19 @@ struct ExitStatus {
     pp_err: Option<String>
 }
 
+#[cfg(test)]
+mod tests {
+    use super::split_name_lit;
+
+    #[test]
+    fn split_name_lit_tests() {
+        assert_eq!(split_name_lit("Nat.add"), Some(vec!["Nat", "add"]));
+        assert_eq!(split_name_lit("«123».foo"), Some(vec!["«123»", "foo"]));
+        assert_eq!(split_name_lit("foo.«a.b»"), Some(vec!["foo", "«a.b»"]));
+        assert_eq!(split_name_lit("«»"), Some(vec!["«»"]));
+        assert_eq!(split_name_lit("foo."), None);
+        assert_eq!(split_name_lit("foo..bar"), None);
+        assert_eq!(split_name_lit("«foo"), None);
+        assert_eq!(split_name_lit("«foo»bar"), None);
+    }
+}
