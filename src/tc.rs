@@ -1,11 +1,10 @@
 use crate::env::ReducibilityHint;
 use crate::env::{ConstructorData, Declar, DeclarInfo, Env, InductiveData, RecRule, RecursorData};
 use crate::expr::Expr;
-use crate::level::Level;
 use crate::util::{
     nat_div, nat_mod, nat_sub, nat_gcd, nat_land, nat_lor, 
     nat_xor, nat_shr, nat_shl, ExportFile, ExprPtr, LevelPtr, 
-    LevelsPtr, NamePtr, TcCache, TcCtx, StringPtr
+    LevelsPtr, NamePtr, TcCache, TcCtx, StringPtr, SortedPair
 };
 use std::error::Error;
 use num_traits::pow::Pow;
@@ -98,8 +97,42 @@ impl<'p> ExportFile<'p> {
             }
             Recursor(recursor_data) => {
                 self.with_tc_and_declar(*d.info(), |tc| tc.check_declar_info(d).unwrap());
+                match recursor_data.all_inductives.get(0) {
+                    None => self.with_ctx(|ctx| {
+                        panic!("Recursors must be derived from an associated inductive type, but recursor {:?} had none", ctx.debug_print(recursor_data.info.name))
+                    }),
+                    Some(ind_name) => match self.declars.get(ind_name) {
+                        None => self.with_ctx(|ctx| {
+                            panic!("Recursors must be derived from an associated inductive declaration. Inductive declaration {:?} does not exist", ctx.debug_print(*ind_name))
+                        }),
+                        Some(Inductive {..}) => (),
+                        Some(_) => self.with_ctx(|ctx| {
+                            panic!("Recursors must be derived from an associated inductive type. Declaration {:?} is not an inductive type", ctx.debug_print(*ind_name))
+                        }),
+                    }
+                }
+                let recursor_idx = self.declars.get_index_of(&recursor_data.info.name).unwrap();
                 for ind_name in recursor_data.all_inductives.iter() {
-                    assert!(self.declars.get(ind_name).is_some())
+                    match self.declars.get_index_of(ind_name) {
+                        None => self.with_ctx(|ctx| {
+                            panic!(
+                                "Recursor {:?} references inductive declaration {:?} which does not exist.",
+                                ctx.debug_print(recursor_data.info.name),
+                                ctx.debug_print(*ind_name)
+                            )
+                        }),
+                        Some(ind_idx) => if recursor_idx <= ind_idx {
+                            self.with_ctx(|ctx| {
+                                panic!(
+                                    "Inductive declarations must be exported prior to any derived recursors. ({:?}, {}), ({:?}, {})",
+                                    ctx.debug_print(recursor_data.info.name),
+                                    recursor_idx,
+                                    ctx.debug_print(*ind_name),
+                                    ind_idx
+                                )
+                            })
+                        } 
+                    }
                 }
             }
         }
@@ -215,7 +248,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         // `c_name = Point`
         let (_f, c_name, c_levels, args) = self.ctx.unfold_const_apps(e_type)?;
         // `Point` declaration
-        let InductiveData { all_ctor_names, .. } = self.env.get_inductive(&c_name)?;
+        let InductiveData { all_ctor_names, .. } = self.env.get_structure(&c_name, false)?;
         // Name = `Point.mk`
         let ctor_name0 = all_ctor_names.get(0).copied()?;
         // Ctor data for `Point.mk`
@@ -324,10 +357,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     fn def_eq_unit(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> Option<bool> {
         let x_ty = self.infer_then_whnf(x, InferOnly);
         let (_, name, _levels, _) = self.ctx.unfold_const_apps(x_ty)?;
-        let InductiveData { num_indices, all_ctor_names, .. } = self.env.get_inductive(&name)?;
-        if all_ctor_names.len() != 1 || *num_indices != 0 {
-            return None
-        }
+        let InductiveData { all_ctor_names, .. } = self.env.get_structure(&name, false)?;
         let ctor_name = &all_ctor_names[0];
         let ctor = self.env.get_constructor(ctor_name)?;
         if ctor.num_fields != 0 {
@@ -432,15 +462,13 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         self.whnf(ty)
     }
 
-    #[allow(non_snake_case)]
     fn infer_proj(&mut self, _ty_name: NamePtr<'t>, idx: usize, structure: ExprPtr<'t>, flag: InferFlag) -> ExprPtr<'t> {
-        let structure_ty = self.infer(structure, flag);
-        let structure_ty = self.whnf(structure_ty);
-        let structure_ty_is_prop = self.is_proposition(structure_ty).0;
+        let structure_ty = self.infer_then_whnf(structure, flag);
+        let structure_ty_may_be_prop = self.may_be_prop(structure_ty).0;
         let (_, struct_ty_name, struct_ty_levels, struct_ty_args) = self.ctx.unfold_const_apps(structure_ty).unwrap();
 
         let InductiveData { info: inductive_info, all_ctor_names, num_params, .. } =
-            self.env.get_inductive(&struct_ty_name).unwrap();
+            self.env.get_structure(&struct_ty_name, true).unwrap();
 
         let ConstructorData { info: ctor_info, .. } = self.env.get_constructor(&all_ctor_names[0]).unwrap();
         let mut ctor_ty = self.ctx.subst_declar_info_levels(*ctor_info, struct_ty_levels);
@@ -458,7 +486,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             match self.ctx.read_expr(ctor_ty) {
                 Pi { binder_type, body, .. } => {
                     if self.ctx.num_loose_bvars(body) != 0 {
-                      if structure_ty_is_prop && !self.is_proposition(binder_type).0 {
+                      if structure_ty_may_be_prop && !self.is_prop(binder_type).0 {
                           panic!("infer_proj prop")
                       }
                       let arg = self.ctx.mk_proj(inductive_info.name, i, structure);
@@ -473,7 +501,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         let reduced = self.whnf(ctor_ty);
         match self.ctx.read_expr(reduced) {
             Pi { binder_type, .. } => {
-                if structure_ty_is_prop && !self.is_proposition(binder_type).0 {
+                if structure_ty_may_be_prop && !self.is_prop(binder_type).0 {
                     panic!("infer_proj prop")
                 }
                 binder_type
@@ -671,7 +699,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             if !reduce_types && matches!(self.ctx.read_expr(ty), Sort {..}) {
                 return e
             }
-            if !reduce_proofs && self.is_proposition(ty).0 {
+            if !reduce_proofs && self.is_prop(ty).0 {
                 return e
             }
         }
@@ -874,8 +902,10 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
 
     fn def_eq_proj(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
         match self.ctx.read_expr_pair(x, y) {
-            (Proj { idx: idx_l, structure: structure_l, .. }, Proj { idx: idx_r, structure: structure_r, .. }) =>
-                idx_l == idx_r && self.def_eq(structure_l, structure_r),
+            (
+                Proj { ty_name: ty_name_l, idx: idx_l, structure: structure_l, .. },
+                Proj { ty_name: ty_name_r, idx: idx_r, structure: structure_r, .. }
+            ) => ty_name_l == ty_name_r && idx_l == idx_r && self.def_eq(structure_l, structure_r),
             _ => false,
         }
     }
@@ -928,7 +958,10 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         if let Some(easy) = self.def_eq_quick_check(x, y) {
             return easy
         }
-
+        let defeq_fail_cache_key = (x, y, self.ctx.eager_mode);
+        if self.tc_cache.defeq_fail_cache.contains(&defeq_fail_cache_key) {
+            return false
+        }
         let x_n = self.whnf_no_unfolding_cheap_proj(x);
         let y_n = self.whnf_no_unfolding_cheap_proj(y);
 
@@ -968,7 +1001,9 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             }
         };
         if result {
-            self.tc_cache.eq_cache.union(x, y);
+            self.tc_cache.eq_cache.insert(SortedPair::new(x, y));
+        } else {
+            self.tc_cache.defeq_fail_cache.insert(defeq_fail_cache_key);        
         }
         result
     }
@@ -1024,9 +1059,8 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
             let e_type_f = self.ctx.unfold_apps_fun(e_type);
             match self.ctx.read_expr(e_type_f) {
                 Const { name, .. } if name == ind_name => {
-                    let e_sort = self.infer_then_whnf(e_type, InferOnly);
                     // If it's a prop, return the original `e`
-                    if e_sort == self.ctx.prop() {
+                    if self.may_be_prop(e_type).0 {
                         e
                     } else {
                         // if it's not a prop, try to eta expand
@@ -1144,7 +1178,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         if x == y {
             return Some(true)
         }
-        if self.tc_cache.eq_cache.check_uf_eq(x, y) {
+        if self.tc_cache.eq_cache.contains(&SortedPair::new(x, y)) {
             return Some(true)
         }
         if let Some(r) = self.def_eq_sort(x, y) {
@@ -1157,13 +1191,11 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
     }
 
     fn failure_cache_contains(&self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {
-        let pr = if x.get_hash() <= y.get_hash() { (x, y) } else { (y, x) };
-        self.tc_cache.failure_cache.contains(&pr)
+        self.tc_cache.congr_fail_cache.contains(&SortedPair::new(x, y))
     }
 
     fn failure_cache_insert(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) {
-        let pr = if x.get_hash() <= y.get_hash() { (x, y) } else { (y, x) };
-        self.tc_cache.failure_cache.insert(pr);
+        self.tc_cache.congr_fail_cache.insert(SortedPair::new(x, y));
     }
 
     fn try_eq_const_app(
@@ -1196,7 +1228,7 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
                     (Const { levels: l_levels, .. }, Const { levels: r_levels, .. })
                         if l_args.len() == r_args.len()
                             && !self.failure_cache_contains(x, y)
-                            && l_args.iter().copied().zip(r_args.iter().copied()).all(|(x, y)| self.def_eq(x, y))
+                            && l_args.iter().copied().zip(r_args.iter().copied()).rev().all(|(x, y)| self.def_eq(x, y))
                             && self.ctx.eq_antisymm_many(l_levels, r_levels) =>
                         Some(FoundEqResult(true)),
                     (Const { .. }, Const { .. }) => {
@@ -1281,21 +1313,25 @@ impl<'x, 't: 'x, 'p: 't> TypeChecker<'x, 't, 'p> {
         }
     }
 
-    pub fn is_sort_zero(&mut self, e: ExprPtr<'t>) -> bool {
-        let e = self.whnf(e);
-        match self.ctx.read_expr(e) {
-            Sort { level, .. } => self.ctx.read_level(level) == Level::Zero,
-            _ => false,
+    pub fn is_prop(&mut self, e: ExprPtr<'t>) -> (bool, ExprPtr<'t>) {
+        let ty = self.infer_then_whnf(e, InferOnly);
+        match self.ctx.read_expr(ty) {
+            Sort { level, .. } => (self.ctx.is_zero(level), ty),
+            _ => panic!("expected a sort")
         }
     }
-    pub fn is_proposition(&mut self, e: ExprPtr<'t>) -> (bool, ExprPtr<'t>) {
-        let infd = self.infer(e, InferOnly);
-        (self.is_sort_zero(infd), infd)
+
+    pub fn may_be_prop(&mut self, e: ExprPtr<'t>) -> (bool, ExprPtr<'t>) {
+        let ty = self.infer_then_whnf(e, InferOnly);
+        match self.ctx.read_expr(ty) {
+            Sort { level, .. } => (self.ctx.may_be_prop(level), ty),
+            _ => panic!("expected a sort")
+        }
     }
 
     pub fn is_proof(&mut self, e: ExprPtr<'t>) -> (bool, ExprPtr<'t>) {
         let infd = self.infer(e, InferOnly);
-        (self.is_proposition(infd).0, infd)
+        (self.is_prop(infd).0, infd)
     }
 
     fn proof_irrel_eq(&mut self, x: ExprPtr<'t>, y: ExprPtr<'t>) -> bool {

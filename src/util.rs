@@ -4,7 +4,6 @@ use crate::level::Level;
 use crate::name::Name;
 use crate::pretty_printer::{PpOptions, PrettyPrinter};
 use crate::tc::TypeChecker;
-use crate::union_find::UnionFind;
 use crate::unique_hasher::UniqueHasher;
 use indexmap::{IndexMap, IndexSet};
 use num_bigint::BigUint;
@@ -212,7 +211,8 @@ pub struct ExportFile<'p> {
     pub name_cache: NameCache<'p>,
     pub config: Config,
     // Information used for setting EnvLimit during inductive checking.
-    pub mutual_block_sizes: FxHashMap<NamePtr<'p>, (usize, usize)>
+    pub mutual_block_sizes: FxHashMap<NamePtr<'p>, (usize, usize)>,
+    pub ind_name_to_recursor_names: FxHashMap<NamePtr<'p>, FxHashSet<NamePtr<'p>>>
 }
 
 impl<'p> ExportFile<'p> {
@@ -904,14 +904,29 @@ pub struct NameCache<'p> {
     pub(crate) list_cons: Option<NamePtr<'p>>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SortedPair<'t>(ExprPtr<'t>, ExprPtr<'t>);
+
+impl<'t> SortedPair<'t> {
+    pub fn new(a: ExprPtr<'t>, b: ExprPtr<'t>) -> Self {
+        if a.get_hash() <= b.get_hash() {
+            Self(a, b)
+        } else {
+            Self(b, a)
+        }
+    }
+}
+
 pub(crate) struct TcCache<'t> {
     pub(crate) infer_cache_check: UniqueHashMap<ExprPtr<'t>, ExprPtr<'t>>,
     pub(crate) infer_cache_no_check: UniqueHashMap<ExprPtr<'t>, ExprPtr<'t>>,
     pub(crate) whnf_cache: UniqueHashMap<ExprPtr<'t>, ExprPtr<'t>>,
     pub(crate) whnf_no_unfolding_cache: UniqueHashMap<ExprPtr<'t>, ExprPtr<'t>>,
-    pub(crate) eq_cache: UnionFind<ExprPtr<'t>>,
+    pub(crate) eq_cache: FxHashSet<SortedPair<'t>>,
     /// A cache of congruence failures during the lazy delta step procedure.
-    pub(crate) failure_cache: FxHashSet<(ExprPtr<'t>, ExprPtr<'t>)>,
+    pub(crate) congr_fail_cache: FxHashSet<SortedPair<'t>>,
+    /// per-declaration memo of `def_eq` calls that returned `false` (keyed by the ordered pair and the eager-mode flag).
+    pub(crate) defeq_fail_cache: FxHashSet<(ExprPtr<'t>, ExprPtr<'t>, bool)>,
     /// Strong reduction is not used during type-checking, this is more of a library/inspection feature.
     pub(crate) strong_cache: UniqueHashMap<(ExprPtr<'t>, bool, bool), ExprPtr<'t>>,
 }
@@ -923,8 +938,9 @@ impl<'t> TcCache<'t> {
             infer_cache_no_check: new_unique_hash_map(),
             whnf_cache: new_unique_hash_map(),
             whnf_no_unfolding_cache: new_unique_hash_map(),
-            eq_cache: UnionFind::new(),
-            failure_cache: new_fx_hash_set(),
+            eq_cache: new_fx_hash_set(),
+            congr_fail_cache: new_fx_hash_set(),
+            defeq_fail_cache: new_fx_hash_set(),
             strong_cache: new_unique_hash_map(),
         }
     }
@@ -935,7 +951,8 @@ impl<'t> TcCache<'t> {
         self.whnf_cache.clear();
         self.whnf_no_unfolding_cache.clear();
         self.eq_cache.clear();
-        self.failure_cache.clear();
+        self.congr_fail_cache.clear();
+        self.defeq_fail_cache.clear();
         self.strong_cache.clear();
     }
 }
